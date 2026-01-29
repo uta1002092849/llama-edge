@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 import torch
 import json
-from transformers import AutoModel
+from transformers import AutoModel, AutoConfig
 from huggingface_hub import hf_hub_download
 from fastapi import FastAPI, HTTPException, Security, status, Depends
 from fastapi.security import APIKeyHeader
