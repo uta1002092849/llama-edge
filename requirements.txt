@@ -1,0 +1,15 @@
+# FastAPI and server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Environment variables
+python-dotenv
+
+# ML and transformers
+torch
+transformers
+huggingface-hub
+
+# API utilities
+pydantic
