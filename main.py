@@ -115,12 +115,13 @@ class ModelWrapper:
         self.model.to(self.device)
         self.model.eval()
 
-    def predict(self, old_ids_context: list[int]) -> list[tuple[float, int, str]]:
+    def predict(self, old_ids_context: list[int], candidate_old_ids: list[int]) -> list[tuple[int, float]]:
         """
         Args:
-            old_ids_context: List of old IDs defining the context.
+            old_ids_context: List of old IDs defining the context (query_session).
+            candidate_old_ids: List of candidate old IDs to rank.
         Returns:
-            sorted_predictions: List of (prob, old_id, label) sorted by probability descending.
+            sorted_predictions: List of (old_id, score) sorted by score descending.
         """
         # 1. Convert context list of old IDs to new IDs
         input_ids = []
@@ -129,7 +130,13 @@ class ModelWrapper:
             new_id, _ = self.mapper.map_old_id(old_id)
             input_ids.append(new_id)
 
-        # 2. Run inference
+        # 2. Convert candidate old IDs to new IDs
+        candidate_new_ids = []
+        for old_id in candidate_old_ids:
+            new_id, _ = self.mapper.map_old_id(old_id)
+            candidate_new_ids.append(new_id)
+
+        # 3. Run inference
         # Create tensor on result device (batch size = 1)
         model_input = torch.tensor([input_ids], dtype=torch.long, device=self.device)
 
@@ -137,25 +144,21 @@ class ModelWrapper:
             logits = self.model(model_input)
             # Get logits for the last token in the sequence
             last_token_logits = logits[0, -1, :]
-            probs = torch.softmax(last_token_logits, dim=-1)
+            
+            # 4. Gather logits only for candidate edges
+            candidate_logits = last_token_logits[candidate_new_ids]
+            
+            # 5. Renormalize: compute softmax over only the candidate logits
+            candidate_probs = torch.softmax(candidate_logits, dim=-1)
 
-        # 3. Sort by probability descending
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-
-        sorted_probs = sorted_probs.tolist()
-        sorted_indices = sorted_indices.tolist()  # These indices are the new_ids
-
-        # 4. Create result list with mapping applied
+        # 6. Create list of (old_id, score) pairs
         results = []
-        for prob, new_id in zip(sorted_probs, sorted_indices):
-            try:
-                # map_new_id returns (old_id, is_edge)
-                old_id, _ = self.mapper.map_new_id(new_id)
-                label = self.mapper.label_from_new_id(new_id)
-                results.append((prob, old_id, label))
-            except KeyError:
-                # Handle indices not in mapper (e.g., padding tokens)
-                results.append((prob, -1, "<PAD/UNK>"))
+        for i, old_id in enumerate(candidate_old_ids):
+            score = candidate_probs[i].item()
+            results.append((old_id, score))
+        
+        # 7. Sort by score descending
+        results.sort(key=lambda x: x[1], reverse=True)
 
         return results
 
@@ -172,7 +175,7 @@ async def lifespan(app: FastAPI):
     model = AutoModel.from_pretrained(
         model_id, 
         trust_remote_code=True, 
-        torch_dtype=torch.bfloat16
+        dtype=torch.bfloat16
     )
     
     # Load the UnifiedIdMapper
@@ -203,36 +206,24 @@ app = FastAPI(
 # Pydantic models for request/response
 class PredictionRequest(BaseModel):
     """Request model for edge prediction"""
-    context_ids: List[int] = Field(
+    query_session: List[int] = Field(
         ...,
-        description="List of old IDs defining the context for prediction",
-        example=[108, 112, 117, 349, 421, 608, 761, 765, 805, 912]
+        description="List of old IDs defining the context/query session",
+        json_schema_extra={"example": [108, 112, 117, 349, 421, 608, 761, 765, 805, 912]}
     )
-    top_k: Optional[int] = Field(
-        10,
-        description="Number of top predictions to return",
-        ge=1,
-        le=100
+    candidate_edges: List[int] = Field(
+        ...,
+        description="List of candidate edge old IDs to rank",
+        json_schema_extra={"example": [100, 200, 300, 400, 500]}
     )
-
-
-class PredictionItem(BaseModel):
-    """Single prediction item"""
-    rank: int = Field(..., description="Rank of this prediction (1-based)")
-    id: int = Field(..., description="Predicted old ID")
-    label: str = Field(..., description="Label corresponding to the ID")
-    probability: float = Field(..., description="Prediction probability")
 
 
 class PredictionResponse(BaseModel):
     """Response model for edge prediction"""
-    predictions: List[PredictionItem] = Field(
+    ranked_edges: List[List] = Field(
         ...,
-        description="List of top-k predictions sorted by probability"
-    )
-    total_predictions: int = Field(
-        ...,
-        description="Total number of predictions made"
+        description="List of [candidate_edge_id, score] pairs sorted by score descending",
+        json_schema_extra={"example": [[300, 0.45], [100, 0.30], [500, 0.15], [200, 0.08], [400, 0.02]]}
     )
 
 
@@ -278,18 +269,18 @@ async def health_check():
     "/predict",
     response_model=PredictionResponse,
     tags=["Prediction"],
-    summary="Predict edge given context",
-    description="Predict the most likely edges given a list of context IDs"
+    summary="Rank candidate edges given query session",
+    description="Rank candidate edges based on query session context"
 )
 async def predict(
     request: PredictionRequest,
     api_key: str = Depends(verify_api_key)
 ) -> PredictionResponse:
     """
-    Predict edges based on context IDs.
+    Rank candidate edges based on query session.
     
-    The model will return predictions sorted by probability in descending order.
-    You can control how many predictions to return using the top_k parameter.
+    The model will compute probabilities only over the provided candidate edges
+    and return them sorted by score in descending order.
     """
     if model_wrapper is None:
         raise HTTPException(
@@ -298,32 +289,23 @@ async def predict(
         )
     
     try:
-        # Get predictions from model
-        predictions = model_wrapper.predict(request.context_ids)
+        # Get predictions from model (returns list of (old_id, score) tuples)
+        predictions = model_wrapper.predict(
+            request.query_session,
+            request.candidate_edges
+        )
         
-        # Limit to top_k results
-        top_predictions = predictions[:request.top_k]
-        
-        # Format response
-        prediction_items = [
-            PredictionItem(
-                rank=rank,
-                id=pred_id,
-                label=label,
-                probability=prob
-            )
-            for rank, (prob, pred_id, label) in enumerate(top_predictions, start=1)
-        ]
+        # Format response as list of [id, score] pairs
+        ranked_edges = [[old_id, score] for old_id, score in predictions]
         
         return PredictionResponse(
-            predictions=prediction_items,
-            total_predictions=len(predictions)
+            ranked_edges=ranked_edges
         )
         
     except KeyError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid context ID in input: {str(e)}"
+            detail=f"Invalid ID in input: {str(e)}"
         )
     except Exception as e:
         raise HTTPException(
